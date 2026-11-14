@@ -1,0 +1,11 @@
+{
+  "name": "Telegram Channel Exporter",
+  "entry": "index.tsx",
+  "version": "1.0.0",
+  "icon": "text.document",
+  "color": "#1685CA",
+  "description": "Export text history from Telegram channels on iPhone.",
+  "localizedNames": { "zh": "Telegram 频道导出", "en": "Telegram Channel Exporter" },
+  "localizedDescriptions": { "zh": "导出 Telegram 频道文字历史，支持断点续传。" },
+  "runInApp": true
+}
