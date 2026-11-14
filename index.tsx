@@ -1,6 +1,6 @@
 import {
-  Button, Dialog, ForEach, HStack, Label, List, Navigation, NavigationStack,
-  ProgressView, Script, Section, Text, TextField, VStack, useRef, useState,
+  Button, ForEach, HStack, Label, List, Navigation, NavigationStack,
+  ProgressView, Script, Section, SecureField, Text, TextField, VStack, useRef, useState,
 } from "scripting"
 import { rmSync } from "node:fs"
 import { Archive } from "./archive"
@@ -13,7 +13,7 @@ import {
 import type { Channel, Credentials, SavedLogin } from "./telegram"
 
 type Operation = "login" | "channels" | "export" | "save" | "settings" | "signout"
-type Page = "home" | "channels" | "settings"
+type Page = "home" | "channels" | "settings" | "login" | "api"
 type Runtime = {
   client?: Telegram
   work?: AbortController
@@ -22,26 +22,14 @@ type Runtime = {
 }
 const CANCELLED = "AUTH_USER_CANCEL"
 
-function alert(message: string, title = "Telegram 频道导出") {
-  return Dialog.alert({ title, message, buttonLabel: "好" })
+type Challenge = {
+  kind: "code" | "password" | "email"
+  title: string
+  detail?: string
 }
-
-async function prompt(title: string, options: Omit<Parameters<typeof Dialog.prompt>[0], "title"> = {}) {
-  const value = await Dialog.prompt({ ...options, title, cancelLabel: "取消", confirmLabel: "继续" })
-  if (!value) throw new Error(CANCELLED)
-  return value
-}
-
-async function apiConfig(): Promise<Credentials> {
-  const id = Number((await prompt("Telegram API ID", {
-    message: "在 my.telegram.org 的 API development tools 获取。",
-    keyboardType: "numberPad",
-  })).trim())
-  const hash = (await prompt("Telegram API Hash", {
-    obscureText: true,
-  })).trim()
-  if (!validAPI(id, hash)) throw new Error("API ID 应为正整数，API Hash 应为 32 位十六进制字符。")
-  return { apiId: id, apiHash: hash }
+type PendingChallenge = {
+  resolve: (value: string) => void
+  reject: (error: Error) => void
 }
 
 async function closeClient(runtime: Runtime) {
@@ -64,6 +52,56 @@ function ExporterView({ runtime, saved, startupError }: {
   const [status, setStatus] = useState(startupError || "")
   const [cancelling, setCancelling] = useState(false)
   const confirmOpen = useRef(false)
+
+  const [apiId, setApiId] = useState("")
+  const [apiHash, setApiHash] = useState("")
+  const [phone, setPhone] = useState("")
+  const [challenge, setChallenge] = useState<Challenge | null>(null)
+  const [reply, setReply] = useState("")
+  const pending = useRef<PendingChallenge | null>(null)
+
+  function openCredentials(destination: "api" | "login") {
+    setApiId("")
+    setApiHash("")
+    setPhone("")
+    setStatus("")
+    setPage(destination)
+  }
+
+  function credentials(reuseSaved: boolean): Credentials {
+    const id = apiId.trim()
+    const hash = apiHash.trim()
+    if (reuseSaved && !id && !hash) {
+      const api = loadAPI()
+      if (api) return api
+    }
+    if (!/^\d+$/.test(id) || !validAPI(Number(id), hash)) {
+      throw new Error("请填写数字 API ID 和 32 位十六进制 API Hash。")
+    }
+    return { apiId: Number(id), apiHash: hash }
+  }
+
+  function requestInput(input: Challenge) {
+    if (runtime.closing) return Promise.reject(new Error(CANCELLED))
+    return new Promise<string>((resolve, reject) => {
+      pending.current = { resolve, reject }
+      setReply("")
+      setChallenge(input)
+    })
+  }
+
+  function submitInput(cancel: boolean) {
+    const waiting = pending.current
+    if (!waiting) return
+    const value = challenge?.kind === "password" ? reply : reply.trim()
+    if (!cancel && !value) return
+    pending.current = null
+    setReply("")
+    setChallenge(null)
+    setStatus("")
+    if (cancel) waiting.reject(new Error(CANCELLED))
+    else waiting.resolve(value)
+  }
 
   function perform(kind: Operation, fallback: string, action: () => Promise<void>) {
     if (runtime.closing || runtime.operation) return
@@ -99,32 +137,32 @@ function ExporterView({ runtime, saved, startupError }: {
   function signIn() {
     perform("login", "登录失败。请检查网络与 API 配置后重试。", async () => {
       if (loadLogin()) throw new Error("本机已有登录会话，请重新打开脚本。")
-      const api = loadAPI() || await apiConfig()
+      const number = phone.replace(/[\s()-]/g, "")
+      if (!/^\+[1-9]\d{6,14}$/.test(number)) throw new Error("请填写带国际区号的手机号，例如 +86 开头。")
+      const api = credentials(true)
       saveSecret(API_KEY, api)
-      const phone = (await prompt("Telegram 手机号", {
-        message: "请输入带国际区号的手机号，例如 +86 开头。",
-        keyboardType: "phonePad",
-      })).replace(/[\s()-]/g, "")
-      if (!/^\+[1-9]\d{6,14}$/.test(phone)) throw new Error("请填写带国际区号的手机号。")
       const client = new Telegram(api)
       runtime.client = client
       try {
-        const account = await client.signIn(phone, {
-          code: async viaApp => (await prompt("Telegram 登录验证码", {
-            message: viaApp ? "请打开已登录的 Telegram，查看官方发来的验证码。" : "请输入 Telegram 发送给你的验证码。",
-            keyboardType: "numberPad", obscureText: true,
-          })).replace(/\s/g, ""),
-          password: hint => prompt("两步验证密码", {
-            message: hint ? `密码提示：${hint}` : "请输入 Telegram 两步验证密码。",
-            obscureText: true,
+        const account = await client.signIn(number, {
+          code: viaApp => requestInput({
+            kind: "code", title: "Telegram 登录验证码",
+            detail: viaApp ? "请打开已登录的 Telegram，查看官方发来的验证码。" : "请输入 Telegram 发给你的验证码。",
           }),
-          email: () => prompt("Telegram 登录邮箱", { keyboardType: "emailAddress" }),
-          emailCode: () => prompt("邮箱验证码", { keyboardType: "numberPad", obscureText: true }),
-          invalid: message => alert(message),
+          password: hint => requestInput({
+            kind: "password", title: "两步验证密码",
+            detail: hint ? `密码提示：${hint}` : undefined,
+          }),
+          email: () => requestInput({ kind: "email", title: "Telegram 登录邮箱" }),
+          emailCode: () => requestInput({ kind: "code", title: "邮箱验证码" }),
+          invalid: async message => { if (!runtime.closing) setStatus(message) },
         })
         if (!runtime.closing) {
           saveSecret(LOGIN_KEY, account)
           setLogin(account)
+          setApiHash("")
+          setPhone("")
+          setPage("home")
           setStatus("登录成功。")
         }
       } catch (error) {
@@ -286,21 +324,40 @@ function ExporterView({ runtime, saved, startupError }: {
   const filtered = channels.filter(channel => !search || channel.name.toLowerCase().includes(search) ||
     (channel.username && ("@" + channel.username.toLowerCase()).includes(search)))
     .sort((a, b) => a.name.localeCompare(b.name, "zh-Hans"))
-  const navigationTitle = page === "channels" ? "选择频道" : page === "settings" ? "设置" : "Telegram 频道导出"
+  const titles: Record<Page, string> = {
+    home: "Telegram 频道导出", channels: "选择频道", settings: "设置",
+    login: "登录 Telegram", api: "Telegram API 配置",
+  }
+
+  function goBack() {
+    if (challenge) {
+      submitInput(true)
+      return
+    }
+    if (busy) return
+    if (page === "home") {
+      dismiss()
+      return
+    }
+    setApiHash("")
+    setPhone("")
+    setStatus("")
+    setPage(page === "api" ? "settings" : "home")
+  }
 
   return <NavigationStack>
-    <List navigationTitle={navigationTitle} navigationBarTitleDisplayMode="inline"
+    <List navigationTitle={titles[page]} navigationBarTitleDisplayMode="inline"
       interactiveDismissDisabled={busy}
       toolbar={{
-        cancellationAction: <Button title={page === "home" ? "关闭" : "返回"} disabled={busy}
-          action={() => { if (page === "home") dismiss(); else { setPage("home"); setStatus("") } }} />,
+        cancellationAction: <Button title={challenge ? "取消登录" : page === "home" ? "关闭" : "返回"}
+          disabled={busy && !challenge} action={goBack} />,
         primaryAction: page === "home" && Script.supportsMinimization() ?
           <Button title="最小化" disabled={!!operation && !active} action={async () => { await Script.minimize() }} /> : undefined,
       }}>
       {page === "home" && <>
         <Section header={<Text>Telegram 账号</Text>}>
           <Label title={login ? login.label : "未登录"} systemImage={login ? "person.crop.circle.fill" : "person.crop.circle"} />
-          {!login && <Button title="登录 Telegram" systemImage="person.badge.key" disabled={busy} action={signIn} />}
+          {!login && <Button title="登录 Telegram" systemImage="person.badge.key" disabled={busy} action={() => openCredentials("login")} />}
         </Section>
         <Section header={<Text>频道</Text>}>
           {selected && <VStack alignment="leading" spacing={4}>
@@ -360,13 +417,48 @@ function ExporterView({ runtime, saved, startupError }: {
           {!filtered.length && search && <Text foregroundStyle="secondary">没有符合搜索的频道。</Text>}
         </Section>
       </>}
+      {(page === "api" || page === "login") && !challenge && <>
+        <Section header={<Text>Telegram API</Text>}>
+          <TextField title="API ID" prompt="输入数字 API ID" value={apiId}
+            onChanged={setApiId} keyboardType="numberPad" disabled={busy} />
+          <SecureField title="API Hash" prompt="粘贴 32 位 API Hash" value={apiHash}
+            onChanged={setApiHash} autocorrectionDisabled disabled={busy} />
+          <Text font="caption" foregroundStyle="secondary">
+            {"在 my.telegram.org 的 API development tools 获取。"}
+          </Text>
+          {page === "login" && <Text font="caption" foregroundStyle="secondary">
+            {"若已在设置保存过 API 配置，这两项可以留空。"}
+          </Text>}
+        </Section>
+        {page === "login" ?
+          <Section header={<Text>Telegram 手机号</Text>}>
+            <TextField title="手机号" prompt="含国际区号，例如 +86…" value={phone}
+              onChanged={setPhone} keyboardType="phonePad" disabled={busy} />
+            <Button title="继续登录" disabled={busy} action={signIn} />
+          </Section> :
+          <Section>
+            <Button title="保存 API 配置" disabled={busy}
+              action={() => perform("settings", "无法保存 API 配置。", async () => {
+                saveSecret(API_KEY, credentials(false))
+                setApiHash("")
+                setPage("settings")
+                setStatus("已保存 API 配置。")
+              })} />
+          </Section>}
+      </>}
+      {page === "login" && challenge && <Section header={<Text>{challenge.title}</Text>}>
+        {challenge.detail && <Text>{challenge.detail}</Text>}
+        {challenge.kind === "email" ?
+          <TextField key="email" title={challenge.title} value={reply} onChanged={setReply}
+            keyboardType="emailAddress" autocorrectionDisabled /> :
+          <SecureField key={challenge.kind} title={challenge.title} value={reply} onChanged={setReply}
+            keyboardType={challenge.kind === "code" ? "numberPad" : "default"} />}
+        <Button title="提交" disabled={!reply} action={() => submitInput(false)} />
+      </Section>}
       {page === "settings" && <>
         <Section header={<Text>登录与凭据</Text>}>
           <Button title="设置 API ID 与 API Hash" systemImage="key" disabled={busy || !!login}
-            action={() => perform("settings", "无法保存 API 配置。", async () => {
-              saveSecret(API_KEY, await apiConfig())
-              setStatus("已保存 API 配置。")
-            })} />
+            action={() => openCredentials("api")} />
           <Button title="退出 Telegram 登录…" disabled={busy || !login} role="destructive" action={() => signOut(true)} />
           <Button title="清除本机登录信息…" disabled={busy} role="destructive" action={() => signOut(false)} />
         </Section>
@@ -374,8 +466,8 @@ function ExporterView({ runtime, saved, startupError }: {
           <Button title="删除所有账号的导出缓存…" disabled={busy} role="destructive" action={clearArchives} />
         </Section>
       </>}
-      {!active && (status || operation) && <Section header={<Text>状态</Text>}>
-        {operation && <ProgressView />}
+      {!active && (status || (operation && !challenge)) && <Section header={<Text>状态</Text>}>
+        {operation && !challenge && <ProgressView />}
         {status ? <Text foregroundStyle="secondary">{status}</Text> :
           operation === "login" ? <Text>正在连接 Telegram…</Text> :
           operation === "channels" ? <Text>正在读取频道…</Text> : null}
@@ -393,7 +485,7 @@ async function main() {
     catch (error) { startupError = explain(error, "无法读取本机登录会话。") }
     await Navigation.present({ element: <ExporterView runtime={runtime} saved={initial} startupError={startupError} /> })
   } catch {
-    await alert("脚本界面启动失败，请更新 Scripting 后重试。")
+    await Dialog.alert({ title: "Telegram 频道导出", message: "脚本界面启动失败，请更新 Scripting 后重试。", buttonLabel: "好" })
   } finally {
     runtime.closing = true
     runtime.work?.abort()
