@@ -1,7 +1,7 @@
 {
   "name": "Telegram Channel Exporter",
   "entry": "index.tsx",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "icon": "text.document",
   "color": "#1685CA",
   "description": "Export text history from Telegram channels on iPhone.",

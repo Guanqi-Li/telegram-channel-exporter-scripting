@@ -98,7 +98,7 @@ function ExporterView({ runtime, saved, startupError }: {
 
   function signIn() {
     perform("login", "登录失败。请检查网络与 API 配置后重试。", async () => {
-      if (Keychain.get(LOGIN_KEY) !== null) throw new Error("请先在设置中清除无法读取的本机会话。")
+      if (loadLogin()) throw new Error("本机已有登录会话，请重新打开脚本。")
       const api = loadAPI() || await apiConfig()
       saveSecret(API_KEY, api)
       const phone = (await prompt("Telegram 手机号", {
@@ -255,13 +255,13 @@ function ExporterView({ runtime, saved, startupError }: {
       }
       await closeClient(runtime)
       clearSecret(LOGIN_KEY)
-      if (!remote) clearSecret(API_KEY)
       setLogin(null)
       setChannels([])
       setSelected(null)
       setCheckpoint(null)
       setQuery("")
       setPage("home")
+      if (!remote) clearSecret(API_KEY)
       setStatus(serverConfirmed ? "本机登录会话已清除。" :
         "本机登录会话已清除。Telegram 未确认撤销，请在 Telegram 的「设置 → 设备」中结束此会话。")
     })
@@ -390,7 +390,7 @@ async function main() {
   let startupError: string | undefined
   try {
     try { initial = loadLogin() }
-    catch { startupError = "无法读取钥匙串会话。请在设置中清除本机登录信息后重新登录。" }
+    catch (error) { startupError = explain(error, "无法读取本机登录会话。") }
     await Navigation.present({ element: <ExporterView runtime={runtime} saved={initial} startupError={startupError} /> })
   } catch {
     await alert("脚本界面启动失败，请更新 Scripting 后重试。")

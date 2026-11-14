@@ -14,19 +14,41 @@ export type LoginPrompts = {
 
 export const LOGIN_KEY = "telegram-login-v1"
 export const API_KEY = "telegram-api-v1"
-const vault = { accessibility: "first_unlock_this_device", synchronizable: false } as const
+const localKeychain = { synchronizable: false } as const
+const damagedLogin = "钥匙串中的登录记录损坏，请在设置中清除本机会话。"
+
+function keychainError(action: string, cause?: unknown) {
+  const detail = typeof Keychain === "undefined"
+    ? "当前 Scripting 运行环境未提供钥匙串接口。请更新 Scripting，并在 App 内直接运行脚本。"
+    : `无法${action} iOS 钥匙串。请解锁 iPhone，并在 Scripting App 内重试。`
+  return new Error(detail, { cause })
+}
+
+function readSecret(key: string): string | null {
+  try {
+    // Check existence before reading. Some versions throw when reading a missing item.
+    if (typeof Keychain.contains === "function" && !Keychain.contains(key, localKeychain)) return null
+    return Keychain.get(key, localKeychain) ?? null
+  } catch (cause) {
+    throw keychainError("读取", cause)
+  }
+}
 
 export function loadLogin(): SavedLogin | null {
-  const raw = Keychain.get(LOGIN_KEY)
+  const raw = readSecret(LOGIN_KEY)
   if (raw === null) return null
-  const value: SavedLogin = JSON.parse(raw)
-  if (!/^\d+$/.test(value.account) || !validAPI(value.apiId, value.apiHash) ||
-      !value.session || typeof value.label !== "string") throw new Error("钥匙串中的登录记录损坏，请在设置中清除本机会话。")
+
+  let value: SavedLogin
+  try { value = JSON.parse(raw) }
+  catch { throw new Error(damagedLogin) }
+  if (!value || typeof value.account !== "string" || !/^\d+$/.test(value.account) ||
+      !validAPI(value.apiId, value.apiHash) || typeof value.session !== "string" ||
+      !value.session || typeof value.label !== "string") throw new Error(damagedLogin)
   return value
 }
 
 export function loadAPI(): Credentials | null {
-  const raw = Keychain.get(API_KEY)
+  const raw = readSecret(API_KEY)
   if (raw === null) return null
   try {
     const entry: Credentials = JSON.parse(raw)
@@ -35,15 +57,34 @@ export function loadAPI(): Credentials | null {
 }
 
 export function validAPI(id: number, hash: string) {
-  return Number.isInteger(id) && id > 0 && id <= 2147483647 && /^[0-9a-f]{32}$/i.test(hash)
+  return Number.isInteger(id) && id > 0 && id <= 2147483647 &&
+    typeof hash === "string" && /^[0-9a-f]{32}$/i.test(hash)
 }
 
 export function saveSecret(key: string, object: Credentials | SavedLogin) {
-  if (!Keychain.set(key, JSON.stringify(object), vault)) throw new Error("无法写入 iOS 钥匙串。")
+  try {
+    const serialized = JSON.stringify(object)
+    const saved = Keychain.set(key, serialized, {
+      ...localKeychain, accessibility: "first_unlock_this_device",
+    })
+    if (saved === true || (saved == null && Keychain.get(key, localKeychain) === serialized)) return
+  } catch (cause) {
+    throw keychainError("写入", cause)
+  }
+  throw keychainError("写入")
 }
 
 export function clearSecret(key: string) {
-  if (Keychain.get(key) !== null && !Keychain.remove(key)) throw new Error("无法清除 iOS 钥匙串中的记录。")
+  let removalError: unknown
+  try {
+    // A malformed or unreadable value must still be removable.
+    if (typeof Keychain.contains === "function" && !Keychain.contains(key, localKeychain)) return
+    if (Keychain.remove(key, localKeychain) === true) return
+  } catch (cause) {
+    removalError = cause
+  }
+  if (readSecret(key) === null) return
+  throw keychainError("清除", removalError)
 }
 
 function rpcCode(error: unknown): string {
